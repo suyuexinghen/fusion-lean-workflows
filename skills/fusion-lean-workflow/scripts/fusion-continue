@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Watch explicitly routed successors on one authoritative host."""
+import argparse
+from datetime import datetime, timezone
+import fcntl
+import json
+import os
+from pathlib import Path
+import subprocess
+import time
+
+
+def emit(event, **data):
+    print(json.dumps(dict(event=event, time=datetime.now(timezone.utc).isoformat(), **data),
+                     ensure_ascii=False), flush=True)
+
+
+def queue(base, *args):
+    cmd = [*base, *map(str, args)]
+    output = subprocess.run(cmd, text=True, capture_output=True)
+    if output.returncode:
+        raise ValueError(json.loads(output.stderr)["error"])
+    return json.loads(output.stdout)
+
+
+def launch(directory, ticket, task, command, base, retry_seconds):
+    seq = ticket["seq"]
+    with (directory / f"{seq}.log").open("ab") as logfile:
+        try:
+            fcntl.flock(logfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        stat = os.fstat(logfile.fileno())
+        if stat.st_size and time.time() - stat.st_mtime < retry_seconds:
+            return
+        current = queue(base, "show", task["id"])
+        if current["state"] != "ready" or current["rev"] != ticket["rev"]:
+            return
+        packet = dict(dispatch=seq, task=task, host=ticket["data"]["host"],
+                      work_key=ticket["data"]["work_key"], session=ticket["data"]["to"],
+                      queue=base)
+        logfile.write((json.dumps(dict(event="launch", time=datetime.now(timezone.utc).isoformat(),
+                                       packet=packet), ensure_ascii=False) + "\n").encode())
+        logfile.flush()
+        os.fsync(logfile.fileno())
+        env = dict(os.environ, FUSION_CONTINUATION=json.dumps(packet, ensure_ascii=False))
+        emit("launch", task=task["id"], dispatch=seq, session=packet["session"])
+        try:
+            subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL, stdout=logfile,
+                             stderr=subprocess.STDOUT, pass_fds=(logfile.fileno(),),
+                             start_new_session=True)
+        except OSError as err:
+            emit("launcher_error", task=task["id"], dispatch=seq, error=str(err))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--db", type=Path, required=True)
+    parser.add_argument("--repos", type=Path, required=True)
+    parser.add_argument("--host", required=True)
+    parser.add_argument("--session", required=True)
+    parser.add_argument("--receipt", action="append", required=True)
+    parser.add_argument("--routes", type=Path, required=True)
+    parser.add_argument("--interval", type=float, default=5)
+    parser.add_argument("--retry-seconds", type=float, default=60)
+    parser.add_argument("--once", action="store_true")
+    args = parser.parse_args()
+    if args.interval <= 0 or args.retry_seconds <= 0:
+        parser.error("interval and retry-seconds must be positive")
+    base = [str(Path(__file__).resolve().with_name("fusion-task")),
+            "--db", str(args.db.resolve()), "--repos", str(args.repos.resolve())]
+    routes = json.loads(args.routes.read_text())
+    for tid, route in routes.items():
+        command = route.get("command")
+        if (not isinstance(route.get("session"), str) or not route["session"]
+                or not isinstance(route.get("work_key"), str) or not route["work_key"]
+                or not isinstance(command, list) or not command
+                or any(not isinstance(value, str) or not value for value in command)):
+            parser.error(f"invalid route for {tid}")
+    directory = args.db.resolve().with_name(args.db.resolve().name + ".deliveries")
+    directory.mkdir(mode=0o700, exist_ok=True)
+    pending = set(args.receipt)
+    bound = set()
+    admitted = set()
+    last_decisions = {}
+
+    def refresh():
+        for ref in dict.fromkeys(args.receipt):
+            if ref not in pending:
+                continue
+            rows = queue(base, "successors", ref, "--host", args.host, "--session", args.session)
+            for row in rows:
+                key = row["work_key"]
+                deferred = row["deferred_on"]
+                bound.update((key, tid) for tid in row["task_ids"])
+                if not deferred:
+                    admitted.update((key, tid) for tid in row["task_ids"])
+                if last_decisions.get((ref, key)) != deferred:
+                    emit("decision", receipt=ref, work_key=key, action=row["action"],
+                         added=row["added"], recorded=row["recorded"], deferred_on=deferred)
+                    last_decisions[ref, key] = deferred
+            if all(not row["deferred_on"] for row in rows):
+                pending.remove(ref)
+
+    refresh()
+    if any((route["work_key"], tid) not in bound for tid, route in routes.items()):
+        parser.error("every route must be bound to a work key in the supplied receipts")
+    last_observed = {}
+    emit("watch_start", pid=os.getpid(), host=args.host, tasks=list(routes))
+    while True:
+        for tid, route in routes.items():
+            if (route["work_key"], tid) not in admitted:
+                continue
+            task = queue(base, "show", tid)
+            ready_at = datetime.now(timezone.utc).isoformat() if task["state"] == "ready" else None
+            try:
+                delivery = queue(base, "dispatch", tid, "--host", args.host, "--session", args.session,
+                                 "--work-key", route["work_key"], "--to", route["session"],
+                                 "--rev", task["rev"])
+            except ValueError as err:
+                emit("dispatch_deferred", task=tid, error=str(err))
+                continue
+            status = delivery["status"]
+            if last_observed.get(tid) != (status, task["rev"]):
+                predecessor_done = {}
+                if status == "pending_delivery":
+                    for need in task["needs"]:
+                        events = queue(base, "history", need)
+                        predecessor_done[need] = next(
+                            (event["seq"] for event in reversed(events)
+                             if event["action"] == "done"
+                             and event["seq"] < delivery["dispatch"]["seq"]),
+                            None,
+                        )
+                emit("observed", task=tid, rev=task["rev"], status=status,
+                     dispatch=delivery.get("dispatch", {}).get("seq"), ready_observed_at=ready_at,
+                     predecessor_done=predecessor_done)
+                last_observed[tid] = (status, task["rev"])
+            if status == "pending_delivery":
+                ticket = delivery["dispatch"]
+                if ticket["data"]["to"] != route["session"]:
+                    emit("route_conflict", task=tid, dispatch=ticket["seq"], to=ticket["data"]["to"])
+                    continue
+                launch(directory, ticket, task, route["command"], base, args.retry_seconds)
+        if args.once or (not pending and all(last_observed.get(tid, ("",))[0] == "done" for tid in routes)):
+            return
+        time.sleep(args.interval)
+        refresh()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "tasks": [
+    {
+      "id": "LATER-EXPECT",
+      "goal": "later-aggregation",
+      "stage": "fixture",
+      "role": "C",
+      "title": "Test LATER-EXPECT",
+      "acceptance": "Pass the isolated synthetic fixture.",
+      "needs": [
+        "EARLIER-CLOSE"
+      ],
+      "independent_of": []
+    },
+    {
+      "id": "LATER-BUILD",
+      "goal": "later-aggregation",
+      "stage": "fixture",
+      "role": "B",
+      "title": "Test LATER-BUILD",
+      "acceptance": "Pass the isolated synthetic fixture.",
+      "needs": [
+        "LATER-EXPECT"
+      ],
+      "independent_of": []
+    },
+    {
+      "id": "LATER-RUN",
+      "goal": "later-aggregation",
+      "stage": "fixture",
+      "role": "compute",
+      "title": "Test LATER-RUN",
+      "acceptance": "Pass the isolated synthetic fixture.",
+      "needs": [
+        "LATER-EXPECT"
+      ],
+      "independent_of": []
+    },
+    {
+      "id": "LATER-REVIEW",
+      "goal": "later-aggregation",
+      "stage": "fixture",
+      "role": "judge",
+      "title": "Test LATER-REVIEW",
+      "acceptance": "Pass the isolated synthetic fixture.",
+      "needs": [
+        "LATER-BUILD",
+        "LATER-RUN"
+      ],
+      "independent_of": [
+        "LATER-BUILD",
+        "LATER-RUN"
+      ]
+    }
+  ]
+}

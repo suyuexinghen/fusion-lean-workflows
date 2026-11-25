@@ -1,0 +1,536 @@
+#!/usr/bin/env python3
+"""Shared, local task queue for the Fusion Lean projects."""
+import argparse
+from contextlib import closing, contextmanager
+from fnmatch import fnmatchcase
+from graphlib import CycleError, TopologicalSorter
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from workflow_projects import PROJECTS, project_path
+
+
+APP_ID = 0x4655534E
+ROLE_SKILLS = {
+    "A": "fusion-lean-integrate/SKILL.md",
+    "B": "fusion-lean-formalize/SKILL.md",
+    "C": "fusion-lean-source-review/SKILL.md",
+    "literature": "fusion-lean-literature/SKILL.md",
+    "compute": "fusion-compute/SKILL.md",
+    "editor": "fusion-lean-editor/SKILL.md",
+    "evidence": "fusion-lean-evidence/SKILL.md",
+    "judge": "fusion-lean-judge/SKILL.md",
+}
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+DEFAULT_DB = DEFAULT_STATE / "fusion-lean-workflows/queue.sqlite3"
+
+
+class Problem(ValueError):
+    pass
+
+
+class NoWork(Problem):
+    pass
+
+
+def dump(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def words(value, field):
+    if not isinstance(value, str) or not value.strip():
+        raise Problem(f"{field} requires nonempty text")
+    return value.strip()
+
+
+def key(value, field):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", value):
+        raise Problem(f"invalid {field}: {value!r}")
+    return value
+
+
+def keys(value, field):
+    if not isinstance(value, list):
+        raise Problem(f"{field} requires an array")
+    ids = [key(item, field) for item in value]
+    if len(ids) != len(set(ids)):
+        raise Problem(f"{field} contains duplicates")
+    return sorted(ids)
+
+
+def definition(raw):
+    if not isinstance(raw, dict):
+        raise Problem("each task must be an object")
+    required = {"id", "goal", "stage", "role", "title", "acceptance"}
+    optional = {"priority", "needs", "independent_of", "resources", "artifacts"}
+    missing = required - raw.keys()
+    extra = raw.keys() - required - optional
+    if missing or extra:
+        raise Problem(f"missing fields {sorted(missing)}, unknown fields {sorted(extra)}")
+    task = {k: key(raw[k], k) for k in ("id", "goal", "stage", "role")}
+    for k in ("title", "acceptance"):
+        task[k] = words(raw[k], k)
+    for k in ("needs", "independent_of", "resources"):
+        task[k] = keys(raw.get(k, []), k)
+    patterns = raw.get("artifacts", [])
+    if not isinstance(patterns, list) or not all(isinstance(p, str) and ":" in p and
+            p.partition(":")[0] in PROJECTS and p.partition(":")[2] for p in patterns):
+        raise Problem("artifacts requires an array of project:path patterns")
+    task["artifacts"] = sorted(set(patterns))
+    if not set(task["independent_of"]) <= set(task["needs"]):
+        raise Problem("independent_of must be a subset of needs")
+    priority = raw.get("priority", 100)
+    if type(priority) is not int or not 0 <= priority <= 9999:
+        raise Problem("priority must be an integer in [0,9999]")
+    return dict(task, priority=priority)
+
+
+SCHEMA = (
+    """CREATE TABLE task (
+        id TEXT PRIMARY KEY, spec TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','active','blocked','done')),
+        owner TEXT, rev INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '',
+        evidence TEXT NOT NULL DEFAULT '[]', CHECK((state='active') = (owner IS NOT NULL))
+    )""",
+    "CREATE UNIQUE INDEX one_active_per_session ON task(owner) WHERE owner IS NOT NULL",
+    """CREATE TABLE edge (
+        task TEXT REFERENCES task(id), need TEXT REFERENCES task(id), independent INTEGER NOT NULL,
+        PRIMARY KEY(task, need)
+    )""",
+    """CREATE TABLE event (
+        seq INTEGER PRIMARY KEY, time TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        task TEXT NOT NULL REFERENCES task(id), rev INTEGER NOT NULL, action TEXT NOT NULL,
+        actor TEXT NOT NULL, previous_owner TEXT, owner TEXT, note TEXT NOT NULL, data TEXT NOT NULL
+    )""",
+    "CREATE INDEX event_by_task ON event(task,seq)",
+)
+
+
+@contextmanager
+def database(path, *, write, initialize):
+    path = Path(path).expanduser().resolve()
+    if initialize:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    elif not path.is_file():
+        raise Problem(f"missing queue {path}; run init or check --db")
+    mode = "rwc" if initialize else "rw" if write else "ro"
+    with closing(sqlite3.connect(f"{path.as_uri()}?mode={mode}", uri=True, timeout=20)) as db:
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA foreign_keys=ON")
+        db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+        app = db.execute("PRAGMA application_id").fetchone()[0]
+        if initialize and app == 0 and not db.execute("SELECT 1 FROM sqlite_master").fetchone():
+            for sql in SCHEMA:
+                db.execute(sql)
+            db.execute(f"PRAGMA application_id={APP_ID}")
+            db.execute("PRAGMA user_version=1")
+        elif app != APP_ID or db.execute("PRAGMA user_version").fetchone()[0] != 1:
+            raise Problem(f"unrecognized queue format at {path}")
+        yield db
+        db.commit()
+
+
+def log(db, tid, rev, action, actor, previous=None, owner=None, note="", **data):
+    db.execute("""INSERT INTO event(task,rev,action,actor,previous_owner,owner,note,data)
+                  VALUES (?,?,?,?,?,?,?,?)""", (tid, rev, action, actor, previous, owner, note, dump(data)))
+
+
+def add_tasks(db, raw_tasks, actor):
+    if not isinstance(raw_tasks, list) or not raw_tasks:
+        raise Problem("plan requires a nonempty array of tasks")
+    tasks = [definition(raw) for raw in raw_tasks]
+    if len({t["id"] for t in tasks}) != len(tasks):
+        raise Problem("duplicate task ID in plan")
+    added = []
+    for t in tasks:
+        tid = t["id"]
+        spec = dump(t)
+        row = db.execute("SELECT spec FROM task WHERE id=?", (tid,)).fetchone()
+        if row:
+            if row["spec"] != spec:
+                raise Problem(f"{tid} already has a different definition")
+            continue
+        db.execute("INSERT INTO task(id,spec) VALUES (?,?)", (tid, spec))
+        added.append(t)
+    known = {r[0] for r in db.execute("SELECT id FROM task")}
+    for t in added:
+        for need in t["needs"]:
+            if need not in known:
+                raise Problem(f"{t['id']} needs unknown task {need}")
+            db.execute("INSERT INTO edge VALUES (?,?,?)", (t["id"], need, need in t["independent_of"]))
+        log(db, t["id"], 0, "add", actor)
+    graph = TopologicalSorter()
+    for tid, need in db.execute("SELECT task,need FROM edge"):
+        graph.add(tid, need)
+    try:
+        graph.prepare()
+    except CycleError as err:
+        raise Problem(f"dependency cycle: {err.args[1]}") from err
+    return [t["id"] for t in added]
+
+
+class Board:
+    """Compute one consistent view inside the caller's read/write transaction."""
+
+    def __init__(self, db):
+        self.tasks = {}
+        for r in db.execute("SELECT * FROM task"):
+            t = json.loads(r["spec"])
+            t.update(state=r["state"], owner=r["owner"], rev=r["rev"], note=r["note"],
+                     evidence=json.loads(r["evidence"]), needs=[], independent_of=[], dependents=[])
+            self.tasks[t["id"]] = t
+        for tid, need, independent in db.execute("SELECT * FROM edge ORDER BY task,need"):
+            self.tasks[tid]["needs"].append(need)
+            self.tasks[need]["dependents"].append(tid)
+            if independent:
+                self.tasks[tid]["independent_of"].append(need)
+        self.authors = {tid: set() for tid in self.tasks}
+        for tid, owner in db.execute("SELECT DISTINCT task,owner FROM event WHERE owner IS NOT NULL"):
+            self.authors[tid].add(owner)
+        self.active = {t["owner"]: t for t in self.tasks.values() if t["state"] == "active"}
+        self.held = {res: t["id"] for t in self.active.values() for res in t["resources"]}
+
+    def get(self, tid):
+        if tid not in self.tasks:
+            raise Problem(f"unknown task: {tid}")
+        return self.tasks[tid]
+
+    def eligible_reviewer(self, t, session):
+        return all(session not in self.authors[need] for need in t["independent_of"])
+
+    def available_to(self, t, session):
+        if not self.eligible_reviewer(t, session):
+            return False
+        # A previous reviewer must also remain independent when a new fix is assigned.
+        for downstream in t["dependents"]:
+            if t["id"] in self.tasks[downstream]["independent_of"] and session in self.authors[downstream]:
+                return False
+        return True
+
+    def view(self, t):
+        view = dict(t)
+        view["role_skill"] = ROLE_SKILLS.get(t["role"])
+        view["waiting_for"] = [i for i in t["needs"] if self.tasks[i]["state"] != "done"]
+        view["resource_holders"] = sorted({self.held[r] for r in t["resources"]
+                                           if r in self.held and self.held[r] != t["id"]})
+        if view["state"] == "pending":
+            view["state"] = "waiting" if view["waiting_for"] or view["resource_holders"] else "ready"
+        return view
+
+    def select(self, args):
+        tasks = sorted(self.tasks.values(), key=lambda t: (t["priority"], t["id"]))
+        return [self.view(t) for t in tasks if all(getattr(args, k, None) in (None, t[k])
+                                                   for k in ("goal", "stage", "role"))]
+
+
+def transition(db, t, state, owner, action, actor, note, evidence=None, **data):
+    rev = t["rev"] + 1
+    refs = evidence or []
+    db.execute("UPDATE task SET state=?, owner=?, rev=?, note=?, evidence=? WHERE id=?",
+               (state, owner, rev, note, dump(refs), t["id"]))
+    log(db, t["id"], rev, action, actor, t["owner"], owner, note, evidence=refs, **data)
+
+
+def take(board, t, actor):
+    if actor in board.active and board.active[actor]["id"] != t["id"]:
+        raise Problem(f"{actor} already holds {board.active[actor]['id']}")
+    if not board.available_to(t, actor):
+        raise Problem(f"{actor} has an independent-review conflict for {t['id']}")
+
+
+DEFINITION_FIELDS = ("id", "goal", "stage", "role", "title", "acceptance",
+                     "needs", "independent_of", "resources", "artifacts", "priority")
+
+
+def amend(db, t, a):
+    """Correct artifact patterns without letting any other field drift."""
+    plan = json.loads(a.plan.read_text())
+    if (not isinstance(plan, dict) or set(plan) != {"tasks", "version"}
+            or type(plan["version"]) is not int or plan["version"] != 1):
+        raise Problem("expected a version 1 plan with tasks")
+    matches = [raw for raw in plan["tasks"]
+               if isinstance(raw, dict) and raw.get("id") == t["id"]]
+    if len(matches) != 1:
+        raise Problem(f"plan must define {t['id']} exactly once")
+    new = definition(matches[0])
+    old = {k: t[k] for k in DEFINITION_FIELDS}
+    changed = sorted(k for k in DEFINITION_FIELDS if old[k] != new[k])
+    if not changed:
+        return {"changed": False, "id": t["id"], "rev": t["rev"],
+                "artifacts": old["artifacts"]}
+    if changed != ["artifacts"]:
+        raise Problem(f"amend may change only artifacts, plan also changes: {changed}")
+    if not new["artifacts"]:
+        raise Problem("artifacts must not be empty")
+    if t["state"] != "active":
+        raise Problem("task must be active")
+    if t["owner"] != a.session:
+        raise Problem(f"task is owned by {t['owner']}")
+    rev = t["rev"] + 1
+    db.execute("UPDATE task SET spec=?, rev=? WHERE id=?", (dump(new), rev, t["id"]))
+    log(db, t["id"], rev, "amend-artifacts", a.session, t["owner"], t["owner"], a.note,
+        before=old["artifacts"], after=new["artifacts"], plan=str(a.plan))
+    return {"changed": True, "id": t["id"], "rev": rev,
+            "before": old["artifacts"], "after": new["artifacts"]}
+
+
+def evidence_refs(repo_root, refs):
+    result = []
+    for ref in refs:
+        m = re.fullmatch(r"([a-z-]+)@([0-9a-f]{40}|[0-9a-f]{64}):(.+)", ref)
+        if not m or m[1] not in PROJECTS:
+            raise Problem(f"expected project@full-commit:path, got {ref!r}")
+        repo, sha, path = m.groups()
+        if any(p in ("", ".", "..") for p in path.split("/")) or any(ord(c) < 32 for c in path):
+            raise Problem(f"invalid evidence path: {path!r}")
+        for name, expected in ((sha, "commit"), (f"{sha}:{path}", "blob")):
+            proc = subprocess.run(["git", "--no-replace-objects", "-C", str(project_path(repo_root, repo)),
+                                   "cat-file", "-t", name], capture_output=True, text=True)
+            if proc.returncode or proc.stdout.strip() != expected:
+                raise Problem(f"missing Git {expected} for {ref}")
+        if ref not in result:
+            result.append(ref)
+    return result
+
+
+def events(db, args=None):
+    where, params = [], []
+    if getattr(args, "id", None):
+        where.append("e.task=?")
+        params.append(args.id)
+    if getattr(args, "session", None):
+        where.append("(? IN (e.actor,e.owner,e.previous_owner))")
+        params.append(args.session)
+    sql = "SELECT e.*, t.spec FROM event e JOIN task t ON t.id=e.task"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    result = []
+    for row in db.execute(sql + " ORDER BY seq", params):
+        event = dict(row)
+        spec = json.loads(event.pop("spec"))
+        if any(getattr(args, k, None) not in (None, spec[k]) for k in ("goal", "stage", "role")):
+            continue
+        event["data"] = json.loads(event["data"])
+        result.append(event)
+    return result
+
+
+def backup(db, target):
+    # Publish only a fully closed snapshot, and never replace an existing file.
+    target = Path(target).expanduser().resolve()
+    with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".fusion-backup-", delete=False) as temp:
+        staging = Path(temp.name)
+    try:
+        with closing(sqlite3.connect(staging)) as out:
+            db.backup(out)
+        os.link(staging, target)
+    finally:
+        staging.unlink()
+    return {"backup": str(target)}
+
+
+def run(db, a):
+    cmd = a.command
+    if cmd in ("init", "load"):
+        obj = json.loads(a.plan.read_text())
+        if not isinstance(obj, dict) or set(obj) != {"tasks", "version"} or type(obj["version"]) is not int or obj["version"] != 1:
+            raise Problem("expected a version 1 plan with tasks")
+        return {"added": add_tasks(db, obj["tasks"], a.session), "db": str(a.db.expanduser().resolve())}
+    if cmd == "successors":
+        from workflow_continuation import reconcile
+        return reconcile(db, a, Board=Board, add_tasks=add_tasks, definition=definition,
+                         dump=dump, evidence_refs=evidence_refs, key=key, keys=keys,
+                         project_path=project_path, words=words)
+    if cmd in ("dispatch", "start"):
+        from workflow_continuation import delivery
+        return delivery(db, a, Board=Board, events=events, key=key, log=log,
+                        take=take, transition=transition)
+    if cmd == "backup":
+        return backup(db, a.destination)
+    if cmd == "history":
+        if a.id and not db.execute("SELECT 1 FROM task WHERE id=?", (a.id,)).fetchone():
+            raise Problem(f"unknown task: {a.id}")
+        return events(db, a)
+    board = Board(db)
+    if cmd == "health":
+        from workflow_health import report
+        previous = json.loads(a.previous.read_text()) if a.previous else None
+        if a.previous and not isinstance(previous, dict):
+            raise Problem("previous report must be a JSON object")
+        return report(board.select(a), events(db), a.repos, PROJECTS, previous,
+                      getattr(a, "review_registry", None),
+                      getattr(a, "contracts", None) or None)
+    if cmd == "snapshot":
+        return {"version": 1, "tasks": board.select(a), "events": events(db)}
+    if cmd == "show":
+        return board.view(board.get(a.id))
+    if cmd in ("list", "next", "claim"):
+        selected = board.select(a)
+        if cmd == "list":
+            return [t for t in selected if a.session in (None, t["owner"]) and a.state in (None, t["state"])]
+        ready = [t for t in selected if t["state"] == "ready" and board.available_to(t, a.session)]
+        current = board.active.get(a.session)
+        if cmd == "next":
+            if current:
+                return [t for t in selected if t["id"] == current["id"]]
+            return ready
+        if current:
+            if a.id in (None, current["id"]) and any(t["id"] == current["id"] for t in selected):
+                return board.view(current)
+            raise Problem(f"{a.session} already holds {current['id']}")
+        if a.id:
+            t = board.view(board.get(a.id))
+            if t not in selected or t["state"] != "ready":
+                raise Problem(f"{a.id} unavailable for this selection ({t['state']}); inspect show")
+            take(board, t, a.session)
+        elif ready:
+            t = ready[0]
+        else:
+            raise NoWork("no eligible ready task; inspect list or resume the other roles")
+        transition(db, t, "active", a.session, "claim", a.session, t["note"])
+    else:
+        t = board.get(a.id)
+        if t["rev"] != a.rev:
+            raise Problem(f"stale revision {a.rev}, current is {t['rev']}; inspect show")
+        if cmd == "amend":
+            result = amend(db, t, a)
+            updated = Board(db)
+            result["task"] = updated.view(updated.get(t["id"]))
+            return result
+        if cmd == "unblock":
+            if t["state"] != "blocked":
+                raise Problem("task must be blocked")
+            transition(db, t, "pending", None, cmd, a.session, a.note)
+        else:
+            if t["state"] != "active":
+                raise Problem("task must be active")
+            if cmd != "recover" and t["owner"] != a.session:
+                raise Problem(f"task is owned by {t['owner']}")
+            if cmd in ("handoff", "recover"):
+                dest = a.to if cmd == "handoff" else a.session
+                if dest == t["owner"]:
+                    raise Problem("new session already holds this task")
+                take(board, t, dest)
+                transition(db, t, "active", dest, cmd, a.session, a.note)
+            elif cmd == "done":
+                refs = evidence_refs(a.repos, a.evidence)
+                paths = [r.split("@", 1)[0] + ":" + r.split(":", 1)[1] for r in refs]
+                missing = [p for p in t["artifacts"] if not any(fnmatchcase(path, p) for path in paths)]
+                if missing:
+                    raise Problem(f"missing required evidence: {missing}")
+                transition(db, t, "done", None, cmd, a.session, a.note, refs)
+            elif cmd == "revise":
+                if a.fix in board.tasks:
+                    raise Problem("fix needs a fresh task ID")
+                fix = dict(id=a.fix, goal=t["goal"], stage=t["stage"], role=a.fix_role,
+                           title=a.note, acceptance=a.acceptance, priority=t["priority"], resources=a.resource)
+                add_tasks(db, [fix], a.session)
+                # A new leaf cannot create a cycle. Its submitters cannot judge their own fix.
+                db.execute("INSERT INTO edge VALUES (?,?,1)", (t["id"], a.fix))
+                transition(db, t, "pending", None, cmd, a.session, a.note, fix=a.fix)
+            else:
+                state = "blocked" if cmd == "block" else "pending"
+                transition(db, t, state, None, cmd, a.session, a.note)
+    updated = Board(db)
+    return updated.view(updated.get(t["id"]))
+
+
+def parser():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--db", type=Path, default=os.environ.get("FUSION_TASK_DB") or DEFAULT_DB)
+    p.add_argument("--repos", type=Path, default=os.environ.get("FUSION_TASK_REPOS") or Path.cwd(),
+                   help="parent of the local project checkouts (including fusion-compute when used)")
+    sub = p.add_subparsers(dest="command", required=True)
+    for name in ("init", "load"):
+        q = sub.add_parser(name, help="atomically import an immutable task graph")
+        q.add_argument("plan", type=Path, nargs="?" if name == "init" else None, default=ROOT / "plans/demo.json")
+        q.add_argument("--session", default="bootstrap" if name == "init" else None, required=name == "load")
+    queries = {
+        "next": "resume or list eligible tasks in priority order",
+        "list": "filter the task board by goal, stage, role, state or owner",
+        "claim": "resume an active task or atomically take a ready task",
+        "history": "inspect ordered events and previous evidence",
+        "show": "show acceptance criteria, ownership and dependency edges",
+        "backup": "write a consistent SQLite snapshot to a new path",
+        "health": "observe all goals, evidence and recurrent benchmark failures",
+        "snapshot": "export the full board and history at one revision as readable JSON",
+    }
+    for name, help_text in queries.items():
+        q = sub.add_parser(name, help=help_text)
+        if name in ("next", "list", "claim", "history"):
+            for k in ("goal", "stage", "role"):
+                q.add_argument("--" + k)
+            q.add_argument("--session", required=name == "claim")
+        if name == "list":
+            q.add_argument("--state", choices=("ready", "waiting", "blocked", "active", "done"))
+        if name in ("claim", "history", "show"):
+            q.add_argument("id", nargs=None if name == "show" else "?")
+        if name == "health":
+            q.add_argument("--previous", type=Path, help="compare against an earlier health JSON report")
+            q.add_argument("--review-registry", default=None,
+                           help="wiki-relative path of the explicit review registry")
+            q.add_argument("--contract", dest="contracts", action="append", default=[],
+                           metavar="PROJECT@COMMIT:PATH",
+                           help="read an explicit independence contract from a pinned plan file; "
+                                "repeatable")
+        if name == "backup":
+            q.add_argument("destination")
+    actions = {
+        "handoff": "transfer the active task to another session",
+        "release": "return an active task to the queue with a checkpoint",
+        "recover": "take over an abandoned active task with an audited reason",
+        "block": "park an active task pending a named condition",
+        "unblock": "return a blocked task when its condition has changed",
+        "revise": "add a repair dependency and queue the current task for re-review",
+        "amend": "correct artifact patterns only, recording operator, reason and both lists",
+        "done": "finish with immutable Git evidence and unlock dependents",
+    }
+    for name, help_text in actions.items():
+        q = sub.add_parser(name, help=help_text)
+        q.add_argument("id")
+        q.add_argument("--session", required=True)
+        q.add_argument("--rev", type=int, required=True, help="revision returned by claim or show")
+        q.add_argument("--note", required=True)
+        if name == "handoff":
+            q.add_argument("--to", required=True)
+        if name == "done":
+            q.add_argument("--evidence", required=True, action="append", metavar="REPO@COMMIT:PATH")
+        if name == "amend":
+            q.add_argument("--plan", type=Path, required=True,
+                           help="plan that defines the task with the corrected artifacts")
+        if name == "revise":
+            q.add_argument("--fix", required=True)
+            q.add_argument("--fix-role", required=True)
+            q.add_argument("--acceptance", required=True)
+            q.add_argument("--resource", action="append", default=[])
+    from workflow_continuation import register_commands
+    register_commands(sub)
+    return p
+
+
+def main():
+    a = parser().parse_args()
+    try:
+        for k in ("session", "to"):
+            if getattr(a, k, None) is not None:
+                key(getattr(a, k), k)
+        if hasattr(a, "note"):
+            a.note = words(a.note, "note")
+        write = a.command not in ("next", "list", "history", "show", "backup", "snapshot", "health")
+        with database(a.db, write=write, initialize=a.command == "init") as db:
+            result = run(db, a)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    except (ValueError, sqlite3.Error, OSError) as err:
+        print(dump({"error": str(err)}), file=sys.stderr)
+        return 3 if isinstance(err, NoWork) else 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

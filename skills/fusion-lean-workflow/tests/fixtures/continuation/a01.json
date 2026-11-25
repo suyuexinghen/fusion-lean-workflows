@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "tasks": [
+    {
+      "id": "FOLLOW-UP",
+      "goal": "later-review",
+      "stage": "fixture",
+      "role": "judge",
+      "title": "Test FOLLOW-UP",
+      "acceptance": "Pass the isolated synthetic fixture.",
+      "needs": [
+        "EARLIER-CLOSE"
+      ],
+      "independent_of": []
+    }
+  ]
+}

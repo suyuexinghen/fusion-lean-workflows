@@ -1,0 +1,132 @@
+{
+  "version": 1,
+  "tasks": [
+    {
+      "id": "DEMO-SOURCE",
+      "role": "C",
+      "goal": "demo",
+      "stage": "demo",
+      "title": "固定日报合同、输入及独立预期",
+      "needs": [],
+      "independent_of": [],
+      "artifacts": [
+        "fusion-lean-skills:demo/source.json"
+      ],
+      "acceptance": "固定两家合成供应方的缺失标记、数据与有效天数预期。"
+    },
+    {
+      "id": "DEMO-BUILD",
+      "role": "B",
+      "goal": "demo",
+      "stage": "demo",
+      "title": "交付日报计算入口",
+      "needs": [
+        "DEMO-SOURCE"
+      ],
+      "independent_of": [],
+      "artifacts": [
+        "fusion-lean:aggregate.py"
+      ],
+      "acceptance": "将合法零值计入公开入口的分母，保留命令与实际结果。"
+    },
+    {
+      "id": "DEMO-RUN",
+      "role": "compute",
+      "goal": "demo",
+      "stage": "demo",
+      "title": "生成独立数值基准",
+      "needs": [
+        "DEMO-SOURCE"
+      ],
+      "independent_of": [],
+      "artifacts": [
+        "fusion-compute:runs/demo/run.json"
+      ],
+      "acceptance": "用另一计算路径记录有效天数与平均值。"
+    },
+    {
+      "id": "DEMO-RECEIPT",
+      "role": "A",
+      "goal": "demo",
+      "stage": "demo",
+      "title": "汇合公共入口和数值运行",
+      "needs": [
+        "DEMO-BUILD",
+        "DEMO-RUN"
+      ],
+      "independent_of": [],
+      "artifacts": [
+        "fusion-lean-skills:demo/receipt.json"
+      ],
+      "acceptance": "从公共入口编译，执行输入并对照运行记录。"
+    },
+    {
+      "id": "DEMO-WIKI",
+      "role": "editor",
+      "goal": "demo",
+      "stage": "demo",
+      "title": "交付日报读者说明",
+      "needs": [
+        "DEMO-RECEIPT"
+      ],
+      "independent_of": [],
+      "artifacts": [
+        "fusion-lean-wiki:wiki/report.md"
+      ],
+      "acceptance": "解释平均值与分母，提供可核来源和计算证据。"
+    },
+    {
+      "id": "DEMO-BENCH",
+      "role": "evidence",
+      "goal": "demo",
+      "stage": "demo",
+      "title": "独立复跑日报的正反例",
+      "needs": [
+        "DEMO-RECEIPT",
+        "DEMO-BUILD",
+        "DEMO-RUN"
+      ],
+      "independent_of": [
+        "DEMO-BUILD",
+        "DEMO-RUN"
+      ],
+      "artifacts": [
+        "fusion-lean-wiki:evidence/benchmark.json"
+      ],
+      "acceptance": "正常规则通过，丢零样例在同一检查槽失败。"
+    },
+    {
+      "id": "DEMO-JUDGE",
+      "role": "judge",
+      "goal": "demo",
+      "stage": "demo",
+      "title": "独立审读固定的日报稿",
+      "needs": [
+        "DEMO-WIKI"
+      ],
+      "independent_of": [
+        "DEMO-WIKI"
+      ],
+      "artifacts": [
+        "fusion-lean-wiki:evidence/review.json"
+      ],
+      "acceptance": "先从合同固定答案，再核对实际稿件；给修订后的目标版本和摘要。"
+    },
+    {
+      "id": "DEMO-CLOSE",
+      "role": "A",
+      "goal": "demo",
+      "stage": "demo",
+      "title": "核对本轮交付与消费",
+      "needs": [
+        "DEMO-JUDGE",
+        "DEMO-BENCH"
+      ],
+      "independent_of": [],
+      "artifacts": [
+        "fusion-lean-skills:demo/close.json"
+      ],
+      "acceptance": "固定集成、终稿、审读和基准，核对它们所引用的证据。"
+    }
+  ]
+}

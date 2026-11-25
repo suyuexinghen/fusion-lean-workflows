@@ -1,0 +1,3 @@
+interface:
+  display_name: "可验证的自进化工作流"
+  short_description: "用来源、独立审读和跨阶段复验，持续改进项目产物与工作方法"
